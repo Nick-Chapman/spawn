@@ -1,10 +1,10 @@
 
 Simulate ISA with explicit parallelism.
 
-src/test/scala/SpawnCode.scala defines the ISA
-src/test/scala/SpawnCodeImp.scala implements the simulator.
+src/main/scala/SpawnCode.scala defines the ISA.
+src/main/scala/SpawnCodeImp.scala implements the simulator.
 
 src/test/scala/FibVersionTests.scala
-contains examplesof computing fibonacci numbers with explicit parallelism.
+contains examples of computing fibonacci numbers with explicit parallelism.
 
-More human readable code for the same examples in in notes.
+More human readable code for the same examples is in notes/.
