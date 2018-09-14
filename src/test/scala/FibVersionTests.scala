@@ -272,7 +272,7 @@ class FibVersionTests extends FunSuite {
   }
 
 
-  def testFib(name:String,fib:Int => Prog, showStats:Boolean = true) {
+  def testFib(name:String,fib:Int => Prog, showStats:Boolean = false) {
     test(name) {
       val (stats10,res10) = fib(10).exec()
       val (stats11,res11) = fib(11).exec()
