@@ -1,0 +1,31 @@
+
+// Each sum-node has 2 child-masters
+
+Main:
+    w = spawn(Collect)
+    a = num(11)
+    // fallthough
+    
+Fib: //arg in a; send result to w
+    jgz (a-1), FibRec
+    send: a -> w //base cases: fib(0)=0, fib(1)=1
+    die
+
+FibRec:
+    w = spawn(Sum)
+    a = a - 1
+    _ = spawn(Fib) //left
+    a = a - 1
+    jump(Fib) //right
+
+Sum:
+    _,a = awaitMaster
+    _,b = awaitMaster
+    a = a + b
+    send: a -> w
+    die
+
+Collect:
+    _,a = awaitMaster
+    emit(a) //final result
+    die

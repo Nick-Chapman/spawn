@@ -1,0 +1,41 @@
+
+// Fib as a service
+// Not actually a good idea if using the service recursively
+
+Main:
+    f = spawn(FibServiceInit)
+    send: f -> f
+    a = num(11)
+    send: a -> f
+    a = awaitReply
+    emit(a) //final result
+    send -1 -> f //shutdown service
+    die
+
+FibServiceInit:
+    _,f = awaitMaster //know myself
+
+FibService:
+    r,a = awaitMaster
+    jlz a, Die
+    _ = spawn(Fib)
+    jump(FibService)
+
+Fib:
+    jgz (a-1), FibRec
+    send: a -> r //base cases: fib(0)=0, fib(1)=1
+    die
+
+FibRec:
+    a = a - 1
+    send: a -> f
+    a = a - 1
+    send: a -> f
+    a = awaitReply
+    b = awaitReply
+    a = a + b
+    send: a -> r
+    die
+    
+Die:
+    die

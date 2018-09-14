@@ -1,0 +1,29 @@
+
+// Each recursive node has 2 child-slaves
+
+Main:
+    w = spawn(Fib)
+    a = num(11)
+    send: a -> w
+    a = awaitReply
+    emit(a) //final result
+    die
+
+Fib:
+    r,a = awaitMaster
+    jgz (a-1), FibRec
+    send: a -> r //base cases: fib(0)=0, fib(1)=1
+    die
+
+FibRec:
+    w = spawn(Fib) //left
+    a = a - 1
+    send: a -> w
+    w = spawn(Fib) //right
+    a = a - 1
+    send: a -> w
+    a = awaitReply
+    b = awaitReply
+    a = a + b
+    send: a -> r
+    die
