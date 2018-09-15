@@ -32,17 +32,33 @@ object SpawnCodeImp extends SpawnCode {
     }
   }
 
-  trait Box
+  trait Pid
+  object Pid {
+    private case class Rep(pid:Int) extends Pid {
+      override def toString = s"#$pid"
+    }
+    class Gen {
+      private var u : Int = 0
+      def generate() : Pid = {
+        u = u + 1
+        val pid = Rep(u)
+        //println(s"generate -> $pid")
+        pid
+      }
+    }
+  }
+
+  trait Box {
+    override def toString = this match {
+      case Box.Primary(who) => s"$who.p"
+      case Box.Secondary(who) => s"$who.s"
+      case Box.Emit() => "<emit>"
+    }
+  }
   object Box {
-    private case class Rep(lab:Int) extends Box {
-      override def toString = "$" + s"$lab"
-    }
-    private var next : Int = 0
-    def gen() : Box = {
-      val lab = Rep(next)
-      next = next + 1
-      lab
-    }
+    case class Primary(pid:Pid) extends Box
+    case class Secondary(pid:Pid) extends Box
+    case class Emit() extends Box
   }
 
   case object WeBeHung extends Exception()
@@ -71,7 +87,6 @@ object SpawnCodeImp extends SpawnCode {
       case Value.VBox(x) => x
       case x => throw RuntimeTypeError(s"getBox: $x")
     }
-
   }
 
   object Value {
@@ -106,21 +121,22 @@ object SpawnCodeImp extends SpawnCode {
       case Num(x) => (x > 0)
       case v => throw RuntimeTypeError("gtz($v)")
     }
-
   }
-
 
   type Mem = Map[Addr,Value]
   object Mem {
     def empty : Mem = Map()
   }
 
-  type RegState = Map[Reg,Value]
+  case class RegState(m:Map[Reg,Value]) {
+    def get(r:Reg) = m.get(r)
+    def set(r:Reg,v:Value) = RegState(m + (r -> v))
+    def eval(atom:Atom) = Atom.eval(atom,this)
+  }
   object RegState {
-    def empty : RegState = Map()
+    def empty : RegState = RegState(Map())
   }
 
-  
   sealed trait Atom
   object Atom {
     case class Lit(x:Value) extends Atom
@@ -140,8 +156,6 @@ object SpawnCodeImp extends SpawnCode {
   def lab : Lab => Atom = x => Atom.Lit(Value.Label(x))
   def memBase : Atom = Atom.Lit(Value.Address(Addr.base))
 
-
-
   object Cond {
     case object Ltz extends Cond
     case object Gtz extends Cond
@@ -151,6 +165,12 @@ object SpawnCodeImp extends SpawnCode {
       case Cond.Ltz => Value.ltz(v)
       case Cond.Gtz => Value.gtz(v)
     }
+  }
+
+  sealed trait Conn
+  object Conn {
+    case object Master extends Conn
+    case object Reply extends Conn
   }
 
   sealed trait Instr
@@ -167,14 +187,13 @@ object SpawnCodeImp extends SpawnCode {
     case class Spawn(child:Atom, box:Reg) extends Instr
     case class Die() extends Instr
     case class Send(value:Atom, dest:Atom) extends Instr
-    case class AwaitMaster(who:Reg, what:Reg) extends Instr
-    case class AwaitReply(what:Reg) extends Instr
+    case class Await(conn:Conn,who:Reg, what:Reg) extends Instr
     case class Emit(result:Atom) extends Instr
   }
 
-
-
-  trait Why
+  case class Message(contents:Value,sender:Pid)
+  
+  sealed trait Why
   object Y {
     case object Copy extends Why
     case object Add extends Why
@@ -182,7 +201,7 @@ object SpawnCodeImp extends SpawnCode {
     case object Mul extends Why
   }
 
-  trait Action
+  sealed trait Action
   object A {
     case class Nop() extends Action
     case class SetReg(r:Reg,v:Value,y:Why) extends Action
@@ -193,144 +212,138 @@ object SpawnCodeImp extends SpawnCode {
     case class StoreMem(a:Addr,v:Value) extends Action
     case class Spawn(l:Lab,r:Reg) extends Action
     case class Die() extends Action
-    case class Send(from:Pid,m:Message,dest:Box) extends Action
-    case class Await(b:Box,who:Reg,what:Reg) extends Action
+    case class Sending(v:Value,dest:Box) extends Action
+    case class SendStall() extends Action
+    case class Receive(box:Box,m:Message,r1:Reg,r2:Reg) extends Action
+    case class AwaitStall() extends Action
     case class Emit(v:Value) extends Action
   }
 
-
-
-  def executeStage1(core:Core,instruction:Instr) : Action = {
+  def executeStage1(pid:Pid,eth:Eth)(rs:RegState,instruction:Instr) : Action = {
     instruction match {
 
       case I.Mark(_) => A.Nop() //better to not take a sim cycle here
 
       case I.Copy(atom,dest) =>
-        val v = core.eval(atom)
+        val v = rs.eval(atom)
         A.SetReg(dest,v,Y.Copy)
 
       case I.Add(atom1,atom2,dest) =>
-        val v1 = core.eval(atom1)
-        val v2 = core.eval(atom2)
+        val v1 = rs.eval(atom1)
+        val v2 = rs.eval(atom2)
         val v = Value.add(v1,v2)
         A.SetReg(dest,v,Y.Add)
 
       case I.Sub(atom1,atom2,dest) =>
-        val v1 = core.eval(atom1)
-        val v2 = core.eval(atom2)
+        val v1 = rs.eval(atom1)
+        val v2 = rs.eval(atom2)
         val v = Value.sub(v1,v2)
         A.SetReg(dest,v,Y.Sub)
 
       case I.Mul(atom1,atom2,dest) =>
-        val v1 = core.eval(atom1)
-        val v2 = core.eval(atom2)
+        val v1 = rs.eval(atom1)
+        val v2 = rs.eval(atom2)
         val v = Value.mul(v1,v2)
         A.SetReg(dest,v,Y.Mul)
 
       case I.Jump(dest) =>
-        val lab = core.eval(dest).getLabel
+        val lab = rs.eval(dest).getLabel
         A.Jump(lab)
         
       case I.CondJump(scrutinee,cond,dest) =>
-        val value = core.eval(scrutinee)
+        val value = rs.eval(scrutinee)
         if (cond.eval(value)) {
-          val lab = core.eval(dest).getLabel
+          val lab = rs.eval(dest).getLabel
           A.CondJumpTaken(lab)
         } else {
           A.CondJumpNotTaken()
         }
 
       case I.Load(a,reg) =>
-        val addr = core.eval(a).getAddress
+        val addr = rs.eval(a).getAddress
         A.LoadMem(addr,reg)
 
       case I.Store(v,a) =>
-        val value = core.eval(v)
-        val addr = core.eval(a).getAddress
+        val value = rs.eval(v)
+        val addr = rs.eval(a).getAddress
         A.StoreMem(addr,value)
 
       case I.Spawn(child,w) =>
-        val childLabel = core.eval(child).getLabel
+        val childLabel = rs.eval(child).getLabel
         A.Spawn(childLabel,w)
 
       case I.Die() => A.Die()
 
       case I.Send(aValue,aDest) =>
-        val pid : Pid = core.pid
-        val dest = core.eval(aDest).getBox
-        val value = core.eval(aValue)
-        val replyBox = core.secondaryBox
-        val message = Message(value,replyBox)
-        A.Send(pid,message,dest)
+        val dest = rs.eval(aDest).getBox
+        val value = rs.eval(aValue)
+        if (eth.canSend(pid,dest))
+          A.Sending(value,dest)
+        else
+          A.SendStall()
 
-      case I.AwaitMaster(who,what) =>
-        val box = core.primaryBox
-        A.Await(box,who,what)
-
-      case I.AwaitReply(what) =>
-        val box = core.secondaryBox
-        val who = register("_") // bit of an implementation hack
-        A.Await(box,who,what)
+      case I.Await(conn,who,what) =>
+        val box = conn match {
+          case Conn.Master => Box.Primary(pid)
+          case Conn.Reply => Box.Secondary(pid)
+        }
+        eth.peek(box) match {
+          case None => A.AwaitStall()
+          case Some(mes) => A.Receive(box,mes,what,who)
+        }
 
       case I.Emit(aResult) =>
-        val value = core.eval(aResult)
+        val value = rs.eval(aResult)
         A.Emit(value)
     }
   }
 
-
-  trait Pid
-  object Pid {
-    private case class Rep(pid:Int) extends Pid {
-      override def toString = s"[$pid]"
-    }
-    class Gen {
-      private var u : Int = 0
-      def generate() : Pid = {
-        u = u + 1
-        val pid = Rep(u)
-        //println(s"generate -> $pid")
-        pid
-      }
-    }
-  }
-
-  case class Message(contents:Value,reply:Box)
-
   sealed trait Eth {
-    def send(from:Pid,to:Box,m:Message) : Option[Eth] //None, caller must stall
-    def receive(inbox:Box) : Option[(Message,Eth)] //None, caller must stall
+    def canSend(from:Pid,to:Box) : Boolean
+    def send(from:Pid,to:Box,m:Message) : Eth
+    def peek(inbox:Box) : Option[Message]
+    def wipe(inbox:Box) : Eth
   }
+
   object Eth {
     private case class Rep(m:Map[Box,Message]) extends Eth {
 
       //TODO: allow continue after send, even when dest is full
       //except: disallow multiple sends in flight from same pid
-      def send(from:Pid,dest:Box,mes:Message) : Option[Eth] = {
+      def canSend(from:Pid,dest:Box) : Boolean  = {
         m.get(dest) match {
-          case Some(_) => None //full, stall
-          case None => Some(Rep(m + (dest -> mes)))
+          case Some(_) => false
+          case None => true
         }
       }
-      def receive(key:Box) : Option[(Message,Eth)] = {
+
+      def send(from:Pid,dest:Box,mes:Message) : Eth = {
+        Rep(m + (dest -> mes))
+      }
+
+      def peek(key:Box) : Option[Message] = {
         m.get(key) match {
           case None => None //empty, stall
-          case Some(mes) => Some((mes, Rep(m - key)))
+          case Some(mes) => Some(mes)
         }
       }
+
+      def wipe(key:Box) : Eth = {
+        Rep(m - key)
+      }
     }
+
     def empty : Eth = Rep(Map())
   }
 
   sealed trait Core {
     def pid : Pid
-    def primaryBox : Box
-    def secondaryBox : Box
+    def regs : RegState
     def setProgramCounter : Prog => Core
-    def spawn : (Pid,Prog) => (Core,Value)
+    def spawn : (Pid,Prog) => Core
     def fetch : Option[(Instr,Core)]
     def eval : Atom => Value
-    def setReg(debug:Boolean) : (Reg,Value) => Core
+    def setReg : (Reg,Value) => Core
   }
 
   object Core {
@@ -339,9 +352,7 @@ object SpawnCodeImp extends SpawnCode {
       Rep(
         pid,
         Prog.instructions(p),
-        RegState.empty,
-        Box.gen(),
-        Box.gen()
+        RegState.empty
       )
     }
 
@@ -349,37 +360,31 @@ object SpawnCodeImp extends SpawnCode {
       pid : Pid,
       pc : List[Instr],
       rs : RegState,
-      pbox : Box,
-      sbox : Box
     ) extends Core {
 
-      def primaryBox = pbox
-      def secondaryBox = sbox
+      def regs = rs
 
       def setProgramCounter = prog => {
-        Rep(pid, Prog.instructions(prog),rs,pbox,sbox)
+        Rep(pid, Prog.instructions(prog),rs)
       }
 
       def spawn = (pid,prog) => {
-        val pbox = Box.gen()
-        val sbox = Box.gen()
         // the register state is copied
-        (Rep(pid, Prog.instructions(prog),rs,pbox,sbox), Value.VBox(pbox))
+        (Rep(pid, Prog.instructions(prog),rs))
       }
 
       def fetch =
         pc match {
           case Nil => None
-          case instruction::xs => Some((instruction,Rep(pid,xs,rs,pbox,sbox)))
+          case instruction::xs => Some((instruction,Rep(pid,xs,rs)))
         }
 
       def eval =
-        atom => Atom.eval(atom,rs)
+        atom => rs.eval(atom)
 
-      def setReg(debug:Boolean) =
+      def setReg =
         (dest,value) => {
-          if (debug) println(s"$pid $dest = $value")
-          Rep(pid, pc, rs + (dest->value), pbox, sbox)
+          Rep(pid, pc, rs.set(dest,value))
         }
 
     }
@@ -393,7 +398,7 @@ object SpawnCodeImp extends SpawnCode {
 
 
   def applyAction
-    (debug:Boolean,pidGen:Pid.Gen,emitBox:Box,locateLabel:Lab=>Prog)
+    (pidGen:Pid.Gen,emitBox:Box,locateLabel:Lab=>Prog)
     (eth:Eth, mem:Mem, core:Core,action:Action) : Option[(Eth,Mem,List[Core])] = {
 
     def straightLine(core:Core) : List[Core] = List(core)
@@ -404,7 +409,7 @@ object SpawnCodeImp extends SpawnCode {
         Some(eth,mem, straightLine(core))
 
       case A.SetReg(dest,v,_) =>
-        Some(eth,mem, straightLine(core.setReg(debug)(dest,v)))
+        Some(eth,mem, straightLine(core.setReg(dest,v)))
 
       case A.Jump(lab) =>
         Some(eth,mem, straightLine(core.setProgramCounter(locateLabel(lab))))
@@ -417,18 +422,19 @@ object SpawnCodeImp extends SpawnCode {
 
       case A.LoadMem(addr,reg) =>
         val v = mem(addr)
-        Some(eth,mem, straightLine(core.setReg(debug)(reg,v)))
+        Some(eth,mem, straightLine(core.setReg(reg,v)))
 
       case A.StoreMem(addr,value) =>
         val mem1 : Mem = mem + (addr -> value)
-        if (debug) println(s"$addr = $value")
+        //if (debug) println(s"$addr = $value")
         Some(eth,mem1, straightLine(core))
 
       case A.Spawn(childLabel,w) =>
         //TODO: dont spawn if resources unavailable. NoBox for parent
-        val pid = pidGen.generate()
-        val (core1,box) = core.spawn(pid,locateLabel(childLabel))
-        val core2 = core.setReg(debug)(w,box)
+        val childPid = pidGen.generate()
+        val core1 = core.spawn(childPid,locateLabel(childLabel))
+        val box = Box.Primary(childPid)
+        val core2 = core.setReg(w,Value.VBox(box))
         Some(eth,mem,List(core1,core2))
 
       case A.Die() =>
@@ -436,35 +442,28 @@ object SpawnCodeImp extends SpawnCode {
         // only becomes possible if allow send to continue before delivery
         Some(eth,mem,List())
 
-      case A.Send(pid,message,dest) =>
-        eth.send(pid,dest,message) match {
-          case None =>
-            None
-          case Some(eth1) =>
-            Some(eth1,mem,straightLine(core))
+      case A.Sending(value,dest) =>
+        val message = Message(value,core.pid)
+        eth.send(core.pid,dest,message) match { case eth =>
+          Some(eth,mem,straightLine(core))
         }
 
-      case A.Await(box,who,what) =>
-        eth.receive(box) match {
-          case None =>
-            None
-          case Some((mes,eth1)) =>
-            val core1 =
-              core.setReg(debug)(what,mes.contents)
-                .setReg(debug)(who,Value.VBox(mes.reply))
-            Some(eth1,mem,straightLine(core1))
+      case A.SendStall() => None
+
+      case A.Receive(box,mes,r1,r2) =>
+        val Message(value,sender) = mes
+        val replyTo = Box.Secondary(sender)
+        core.setReg(r1,value).setReg(r2,Value.VBox(replyTo)) match { case core =>
+          Some(eth.wipe(box),mem,straightLine(core))
         }
+
+      case A.AwaitStall() => None
 
       case A.Emit(value) =>
-        val pid : Pid = core.pid
-        val dest = emitBox
-        val replyBox = core.secondaryBox
-        val message = Message(value,replyBox)
-        eth.send(pid,dest,message) match {
-          case None =>
-            None
-          case Some(eth1) =>
-            Some(eth1,mem,straightLine(core))
+        val dest = emitBox //hack
+        val message = Message(value,core.pid)
+        eth.send(core.pid,dest,message) match { case eth =>
+          Some(eth,mem,straightLine(core))
         }
 
     }
@@ -474,7 +473,7 @@ object SpawnCodeImp extends SpawnCode {
 
     val pidGen = new Pid.Gen
 
-    val emitBox = Box.gen()
+    val emitBox = Box.Emit()
 
     def locateLabel(lab:Lab) : Prog = {
       def loop : List[Instr] => Prog = {
@@ -489,11 +488,10 @@ object SpawnCodeImp extends SpawnCode {
       core0.fetch match {
         case None => (0,eth,mem,Nil)
         case Some((instruction,core)) =>
-          val action : Action = executeStage1(core,instruction)
-          if (debug) println(s"${core.pid} execute: $instruction")
+          val action = executeStage1(core.pid,eth)(core.regs,instruction)
           if (debug) println(s"${core.pid} action: $action")
           val effect =
-            applyAction(debug,pidGen,emitBox,locateLabel)(eth,mem,core,action)
+            applyAction(pidGen,emitBox,locateLabel)(eth,mem,core,action)
           effect match {
             case None => (1,eth,mem,List(core0)) //STALL
             case Some((eth,mem,cores)) => (0,eth,mem,cores)
@@ -537,8 +535,8 @@ object SpawnCodeImp extends SpawnCode {
     val (stats,finalEth) = loop(cycle=0, maxPar=1, stalls=0,
       initEth,initMem,List(initCore))
 
-    val vOpt = finalEth.receive(emitBox) match {
-      case Some((mes,_)) => Some(mes.contents)
+    val vOpt = finalEth.peek(emitBox) match {
+      case Some(mes) => Some(mes.contents)
       case None => None
     }
     (stats,vOpt)
@@ -580,8 +578,12 @@ object SpawnCodeImp extends SpawnCode {
   def die = Prog(I.Die())
 
   def send(value:Atom, dest:Reg) = Prog(I.Send(value,reg(dest)))
-  def awaitMaster(who:Reg, what:Reg) = Prog(I.AwaitMaster(who,what))
-  def awaitReply(what:Reg) = Prog(I.AwaitReply(what))
+  def awaitMaster(who:Reg, what:Reg) = Prog(I.Await(Conn.Master,who,what))
+
+  def awaitReply(what:Reg) = {
+    val who = register("_") // bit of an implementation hack
+    Prog(I.Await(Conn.Reply,who,what))
+  }
   
   def emit(result:Atom) = Prog(I.Emit(result))
 
