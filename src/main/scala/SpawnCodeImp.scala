@@ -140,6 +140,8 @@ object SpawnCodeImp extends SpawnCode {
   def lab : Lab => Atom = x => Atom.Lit(Value.Label(x))
   def memBase : Atom = Atom.Lit(Value.Address(Addr.base))
 
+
+
   object Cond {
     case object Ltz extends Cond
     case object Gtz extends Cond
@@ -164,11 +166,118 @@ object SpawnCodeImp extends SpawnCode {
     case class Store(value:Atom, mem:Atom) extends Instr
     case class Spawn(child:Atom, box:Reg) extends Instr
     case class Die() extends Instr
-    case class Send(value:Atom, box:Atom) extends Instr
+    case class Send(value:Atom, dest:Atom) extends Instr
     case class AwaitMaster(who:Reg, what:Reg) extends Instr
     case class AwaitReply(what:Reg) extends Instr
     case class Emit(result:Atom) extends Instr
   }
+
+
+
+  trait Why
+  object Y {
+    case object Copy extends Why
+    case object Add extends Why
+    case object Sub extends Why
+    case object Mul extends Why
+  }
+
+  trait Action
+  object A {
+    case class Nop() extends Action
+    case class SetReg(r:Reg,v:Value,y:Why) extends Action
+    case class Jump(l:Lab) extends Action
+    case class CondJumpTaken(l:Lab) extends Action
+    case class CondJumpNotTaken() extends Action
+    case class LoadMem(a:Addr,r:Reg) extends Action
+    case class StoreMem(a:Addr,v:Value) extends Action
+    case class Spawn(l:Lab,r:Reg) extends Action
+    case class Die() extends Action
+    case class Send(from:Pid,m:Message,dest:Box) extends Action
+    case class Await(b:Box,who:Reg,what:Reg) extends Action
+    case class Emit(v:Value) extends Action
+  }
+
+
+
+  def executeStage1(core:Core,instruction:Instr) : Action = {
+    instruction match {
+
+      case I.Mark(_) => A.Nop() //better to not take a sim cycle here
+
+      case I.Copy(atom,dest) =>
+        val v = core.eval(atom)
+        A.SetReg(dest,v,Y.Copy)
+
+      case I.Add(atom1,atom2,dest) =>
+        val v1 = core.eval(atom1)
+        val v2 = core.eval(atom2)
+        val v = Value.add(v1,v2)
+        A.SetReg(dest,v,Y.Add)
+
+      case I.Sub(atom1,atom2,dest) =>
+        val v1 = core.eval(atom1)
+        val v2 = core.eval(atom2)
+        val v = Value.sub(v1,v2)
+        A.SetReg(dest,v,Y.Sub)
+
+      case I.Mul(atom1,atom2,dest) =>
+        val v1 = core.eval(atom1)
+        val v2 = core.eval(atom2)
+        val v = Value.mul(v1,v2)
+        A.SetReg(dest,v,Y.Mul)
+
+      case I.Jump(dest) =>
+        val lab = core.eval(dest).getLabel
+        A.Jump(lab)
+        
+      case I.CondJump(scrutinee,cond,dest) =>
+        val value = core.eval(scrutinee)
+        if (cond.eval(value)) {
+          val lab = core.eval(dest).getLabel
+          A.CondJumpTaken(lab)
+        } else {
+          A.CondJumpNotTaken()
+        }
+
+      case I.Load(a,reg) =>
+        val addr = core.eval(a).getAddress
+        A.LoadMem(addr,reg)
+
+      case I.Store(v,a) =>
+        val value = core.eval(v)
+        val addr = core.eval(a).getAddress
+        A.StoreMem(addr,value)
+
+      case I.Spawn(child,w) =>
+        val childLabel = core.eval(child).getLabel
+        A.Spawn(childLabel,w)
+
+      case I.Die() => A.Die()
+
+      case I.Send(aValue,aDest) =>
+        val pid : Pid = core.pid
+        val dest = core.eval(aDest).getBox
+        val value = core.eval(aValue)
+        val replyBox = core.secondaryBox
+        val message = Message(value,replyBox)
+        A.Send(pid,message,dest)
+
+      case I.AwaitMaster(who,what) =>
+        val box = core.primaryBox
+        A.Await(box,who,what)
+
+      case I.AwaitReply(what) =>
+        val box = core.secondaryBox
+        val who = register("_") // bit of an implementation hack
+        A.Await(box,who,what)
+
+      case I.Emit(aResult) =>
+        val value = core.eval(aResult)
+        A.Emit(value)
+    }
+  }
+
 
   trait Pid
   object Pid {
@@ -282,126 +391,77 @@ object SpawnCodeImp extends SpawnCode {
   }
 
 
-  def execute
-    (debug:Boolean,pidGen:Pid.Gen,emitBox:Box,locateLabel:Lab=>Prog)
-    (eth:Eth, mem:Mem, core:Core,i:Instr) : Option[(Eth,Mem,List[Core])] = {
 
-    val me = core.pid
-    if (debug) println(s"$me execute: $i")
+  def applyAction
+    (debug:Boolean,pidGen:Pid.Gen,emitBox:Box,locateLabel:Lab=>Prog)
+    (eth:Eth, mem:Mem, core:Core,action:Action) : Option[(Eth,Mem,List[Core])] = {
 
     def straightLine(core:Core) : List[Core] = List(core)
+    
+    action match {
 
-    i match {
+      case A.Nop() =>
+        Some(eth,mem, straightLine(core))
 
-      case I.Mark(_) =>
-        Some(eth,mem, straightLine(core)) //better to not take a sim cycle here
-
-      case I.Copy(atom,dest) =>
-        val v = core.eval(atom)
+      case A.SetReg(dest,v,_) =>
         Some(eth,mem, straightLine(core.setReg(debug)(dest,v)))
 
-      case I.Add(atom1,atom2,dest) =>
-        val v1 = core.eval(atom1)
-        val v2 = core.eval(atom2)
-        val v = Value.add(v1,v2)
-        Some(eth,mem, straightLine(core.setReg(debug)(dest,v)))
-
-      case I.Sub(atom1,atom2,dest) =>
-        val v1 = core.eval(atom1)
-        val v2 = core.eval(atom2)
-        val v = Value.sub(v1,v2)
-        Some(eth,mem, straightLine(core.setReg(debug)(dest,v)))
-
-      case I.Mul(atom1,atom2,dest) =>
-        val v1 = core.eval(atom1)
-        val v2 = core.eval(atom2)
-        val v = Value.mul(v1,v2)
-        Some(eth,mem, straightLine(core.setReg(debug)(dest,v)))
-
-      case I.Jump(dest) =>
-        val lab = core.eval(dest).getLabel
+      case A.Jump(lab) =>
         Some(eth,mem, straightLine(core.setProgramCounter(locateLabel(lab))))
-        
-      case I.CondJump(scrutinee,cond,dest) =>
-        val v = core.eval(scrutinee)
-        val lab = core.eval(dest).getLabel
-        if (cond.eval(v)) {
-          Some(eth,mem, straightLine(core.setProgramCounter(locateLabel(lab))))
-        } else {
-          Some(eth,mem, straightLine(core))
-        }
 
-      case I.Load(addr,reg) =>
-        val k = core.eval(addr).getAddress
-        val v = mem(k)
+      case A.CondJumpTaken(lab) =>
+        Some(eth,mem, straightLine(core.setProgramCounter(locateLabel(lab))))
+
+      case A.CondJumpNotTaken() =>
+        Some(eth,mem, straightLine(core))
+
+      case A.LoadMem(addr,reg) =>
+        val v = mem(addr)
         Some(eth,mem, straightLine(core.setReg(debug)(reg,v)))
 
-      case I.Store(value,addr) =>
-        val v = core.eval(value)
-        val k = core.eval(addr).getAddress
-        val mem1 : Mem = mem + (k -> v)
-        if (debug) println(s"$k = $v")
+      case A.StoreMem(addr,value) =>
+        val mem1 : Mem = mem + (addr -> value)
+        if (debug) println(s"$addr = $value")
         Some(eth,mem1, straightLine(core))
 
-      case I.Spawn(child,w) =>
+      case A.Spawn(childLabel,w) =>
         //TODO: dont spawn if resources unavailable. NoBox for parent
-        val childLabel = core.eval(child).getLabel
         val pid = pidGen.generate()
         val (core1,box) = core.spawn(pid,locateLabel(childLabel))
         val core2 = core.setReg(debug)(w,box)
         Some(eth,mem,List(core1,core2))
 
-      case I.Die() =>
+      case A.Die() =>
         //TODO: should stall if have undelivered post
         // only becomes possible if allow send to continue before delivery
         Some(eth,mem,List())
 
-      case I.Send(aValue,aDest) =>
-        val pid : Pid = core.pid
-        val dest = core.eval(aDest).getBox
-        val value = core.eval(aValue)
-        val replyBox = core.secondaryBox
-        val message = Message(value,replyBox)
+      case A.Send(pid,message,dest) =>
         eth.send(pid,dest,message) match {
           case None =>
-            if (debug) println(s"$me - STALL")
             None
           case Some(eth1) =>
             Some(eth1,mem,straightLine(core))
         }
 
-      case I.AwaitMaster(who,what) =>
-        val myPrimBox : Box = core.primaryBox
-        eth.receive(myPrimBox) match {
+      case A.Await(box,who,what) =>
+        eth.receive(box) match {
           case None =>
-            if (debug) println(s"$me - STALL")
             None
           case Some((mes,eth1)) =>
-            val core1 = core.setReg(debug)(what,mes.contents)
-              .setReg(debug)(who,Value.VBox(mes.reply))
+            val core1 =
+              core.setReg(debug)(what,mes.contents)
+                .setReg(debug)(who,Value.VBox(mes.reply))
             Some(eth1,mem,straightLine(core1))
         }
 
-      case I.AwaitReply(what) =>
-        val myBox : Box = core.secondaryBox
-        eth.receive(myBox) match {
-          case None =>
-            if (debug) println(s"$me - STALL")
-            None
-          case Some((mes,eth1)) =>
-            val core1 = core.setReg(debug)(what,mes.contents)
-            Some(eth1,mem,straightLine(core1))
-        }
-
-      case I.Emit(aResult) =>
+      case A.Emit(value) =>
         val pid : Pid = core.pid
         val dest = emitBox
-        val value = core.eval(aResult)
         val replyBox = core.secondaryBox
         val message = Message(value,replyBox)
         eth.send(pid,dest,message) match {
           case None =>
-            println(s"$me - STALL")
             None
           case Some(eth1) =>
             Some(eth1,mem,straightLine(core))
@@ -409,8 +469,7 @@ object SpawnCodeImp extends SpawnCode {
 
     }
   }
-
-
+  
   def simulate(theProg:Prog,debug:Boolean) : (Stats,Option[Value]) = {
 
     val pidGen = new Pid.Gen
@@ -426,21 +485,23 @@ object SpawnCodeImp extends SpawnCode {
       loop(Prog.instructions(theProg))
     }
 
-    def exec = execute(debug,pidGen,emitBox,locateLabel) _
-
-    def stepOneCore(eth:Eth,mem:Mem,core:Core) : (Int,Eth,Mem,List[Core]) = {
-      core.fetch match {
+    def stepOneCore(eth:Eth,mem:Mem,core0:Core) : (Int,Eth,Mem,List[Core]) = {
+      core0.fetch match {
         case None => (0,eth,mem,Nil)
-        case Some((instruction,core1)) =>
-          exec(eth,mem,core1,instruction) match {
-            case None => (1,eth,mem,List(core)) //STALL
+        case Some((instruction,core)) =>
+          val action : Action = executeStage1(core,instruction)
+          if (debug) println(s"${core.pid} execute: $instruction")
+          if (debug) println(s"${core.pid} action: $action")
+          val effect =
+            applyAction(debug,pidGen,emitBox,locateLabel)(eth,mem,core,action)
+          effect match {
+            case None => (1,eth,mem,List(core0)) //STALL
             case Some((eth,mem,cores)) => (0,eth,mem,cores)
           }
       }
     }
 
-    def stepAllCores(eth:Eth, mem:Mem, cores:List[Core])
-        : (Int,Eth,Mem,List[Core]) =
+    def stepAllCores(eth:Eth, mem:Mem, cores:List[Core]) : (Int,Eth,Mem,List[Core]) =
       cores match {
         case Nil => (0,eth,mem,Nil)
         case head::tail =>

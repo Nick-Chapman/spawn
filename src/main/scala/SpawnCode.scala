@@ -14,17 +14,6 @@ trait SpawnCode {
   def lab : Lab => Atom
   def memBase : Atom
 
-  trait Stats {
-    def cycles : Int
-    def maxPar : Int
-    def stalls : Int
-  }
-
-  trait Prog {
-    def exec(debug:Boolean = false) : (Stats,Int)
-    def run(debug:Boolean = false) : Int = exec(debug)._2 //ignore Stats
-  }
-
   def empty : Prog
   def seq : List[Prog] => Prog
   def mark : Lab => Prog
